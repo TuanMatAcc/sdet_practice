@@ -1,0 +1,272 @@
+# Location: .github/workflows/e2e-tests.yml
+#
+# PRACTICE VERSION: every stage tests the public Swag Labs demo site (https://www.saucedemo.com),
+# so the pipeline runs without an application of your own. The structure matches a real setup.
+#
+# One workflow, four stages:
+#   1. Pull request  -> unit tests + @smoke tests                       (can block the merge)
+#   2. Push to main  -> "deploy" to staging, then regression in 4 parallel shards
+#   3. Every night   -> the entire suite on Chromium, Firefox and WebKit
+#   4. On demand     -> @smoke tests against "production"
+#   Stages 3 and 4 can also be started anytime with the "Run workflow" button in the Actions tab.
+#
+# Required setup (Settings -> Secrets and variables -> Actions):
+#   - Secret TEST_PASSWORD = secret_sauce
+#     (the demo site's public password, stored as a secret to practice the real-world habit)
+# Optional:
+#   - Secret SLACK_WEBHOOK_URL to get failure alerts in Slack
+#   - Variables BASE_URL and TEST_USERNAME to override the defaults in the test code
+
+name: E2E tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'      # every night at 02:00 UTC
+  workflow_dispatch:         # the "Run workflow" button in the Actions tab
+    inputs:
+      stage:
+        description: Which stage to run
+        type: choice
+        options: [production-smoke, nightly]
+        default: production-smoke
+
+# Least privilege: these jobs only need to read the code
+permissions:
+  contents: read
+
+# A new push to the same pull request cancels its outdated run.
+# Every other event gets a unique group, so nothing else is ever cancelled.
+concurrency:
+  group: e2e-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # Stage 1: every pull request. Fast feedback, can block the merge.
+  # ------------------------------------------------------------------
+  pr-checks:
+    name: PR checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BASE_URL: ${{ vars.BASE_URL }}
+      TEST_USERNAME: ${{ vars.TEST_USERNAME }}
+      TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+
+      - name: Unit tests (owned by developers)
+        run: npm run test:unit
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Smoke E2E tests
+        run: npx playwright test --grep @smoke --project=chromium
+
+      - name: Upload report
+        if: ${{ !cancelled() }}     # upload even when tests fail, that's when you need it most
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-smoke-report
+          path: |
+            playwright-report/
+            results/
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Stage 2: every push to main. Deploy to staging, then run regression.
+  # ------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to staging
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: staging
+    steps:
+      # In a real project this step builds and deploys your app, e.g. ./scripts/deploy.sh staging
+      - name: Deploy (placeholder)
+        run: echo "Practice repo - the demo site is already live, so there is nothing to deploy."
+
+  regression:
+    name: Regression (shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }})
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: staging          # in a real project, gives the job the staging URL and credentials
+    strategy:
+      fail-fast: false            # let every shard finish so the report is complete
+      matrix:
+        shardIndex: [1, 2, 3, 4]
+        shardTotal: [4]
+    env:
+      BASE_URL: ${{ vars.BASE_URL }}
+      TEST_USERNAME: ${{ vars.TEST_USERNAME }}
+      TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      # Everything except @slow tests, split across 4 machines running in parallel.
+      # The blob reporter saves raw results so the shards can be merged into one report.
+      - name: Run shard
+        run: >-
+          npx playwright test --grep-invert @slow --project=chromium
+          --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
+          --reporter=blob
+
+      - name: Upload shard results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: blob-report-${{ matrix.shardIndex }}
+          path: blob-report/
+          retention-days: 1
+
+  regression-report:
+    name: Merge regression report
+    needs: regression
+    # Build the report even when tests failed, but not if the shards never ran
+    if: ${{ !cancelled() && needs.regression.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+
+      - name: Download all shard results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: blob-report-*
+          path: all-blob-reports
+          merge-multiple: true
+
+      - name: Merge into one HTML report
+        run: npx playwright merge-reports --reporter html ./all-blob-reports
+
+      - name: Upload merged report
+        uses: actions/upload-artifact@v7
+        with:
+          name: regression-report
+          path: playwright-report/
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # Stage 3: every night. The full suite, including @slow tests, on all browsers.
+  # ------------------------------------------------------------------
+  nightly:
+    name: Nightly (${{ matrix.browser }})
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.stage == 'nightly')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: staging
+    strategy:
+      fail-fast: false            # a Firefox failure shouldn't cancel the WebKit run
+      matrix:
+        browser: [chromium, firefox, webkit]
+    env:
+      BASE_URL: ${{ vars.BASE_URL }}
+      TEST_USERNAME: ${{ vars.TEST_USERNAME }}
+      TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Full suite
+        run: npx playwright test --project=${{ matrix.browser }}
+
+      - name: Upload report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-report-${{ matrix.browser }}
+          path: |
+            playwright-report/
+            results/
+          retention-days: 14
+
+  # ------------------------------------------------------------------
+  # Stage 4: after a production release. Quick check that critical paths work.
+  # ------------------------------------------------------------------
+  production-smoke:
+    name: Production smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.stage == 'production-smoke'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      BASE_URL: ${{ vars.BASE_URL }}
+      TEST_USERNAME: ${{ vars.TEST_USERNAME }}
+      TEST_PASSWORD: ${{ secrets.TEST_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      # Smoke tests must be safe to run against real production:
+      # read-only actions and dedicated test accounts only.
+      - name: Smoke tests against production
+        run: npx playwright test --grep @smoke --project=chromium
+
+      - name: Upload report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: production-smoke-report
+          path: |
+            playwright-report/
+            results/
+          retention-days: 30
+
+  # ------------------------------------------------------------------
+  # Alert the team when anything outside a pull request fails.
+  # (Pull request failures already show up on the PR itself.)
+  # ------------------------------------------------------------------
+  notify-failure:
+    name: Notify Slack
+    needs: [regression-report, nightly, production-smoke]
+    # failure() is true if any job earlier in the chain failed, including deploy-staging
+    if: ${{ failure() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - name: Post to Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl -sS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"E2E tests failed (${GITHUB_EVENT_NAME} on ${GITHUB_REF_NAME}). Report: ${RUN_URL}\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Slack not configured
+        if: env.SLACK_WEBHOOK_URL == ''
+        run: echo "Tests failed. Add a SLACK_WEBHOOK_URL secret to get these alerts in Slack."

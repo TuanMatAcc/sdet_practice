@@ -1,0 +1,16 @@
+{
+  "name": "sdet-ci-practice",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright end-to-end tests wired into a staged GitHub Actions pipeline (practice project)",
+  "scripts": {
+    "test": "playwright test",
+    "test:smoke": "playwright test --grep @smoke --project=chromium",
+    "test:unit": "echo \"No unit tests in this practice repo. In a real project, developers' unit tests run here.\"",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.0",
+    "@types/node": "^22.20.5"
+  }
+}
