@@ -9,13 +9,13 @@ import { LoginPage } from '../pages/login-page';
 
 const username = process.env.TEST_USERNAME || 'standard_user';
 
-// The password comes from the TEST_PASSWORD secret in CI, or from your terminal locally.
+// The password comes from the PASSWORD secret in CI, or from your terminal locally.
 // It is never written in the code. Failing loudly beats a confusing login error later.
 function requirePassword(): string {
   const password = process.env.PASSWORD;
   if (!password) {
     throw new Error(
-      'TEST_PASSWORD is not set. Add it as a repository secret in GitHub, ' +
+      'PASSWORD is not set. Add it as a repository secret in GitHub, ' +
         'or set it in your terminal for local runs (see README).',
     );
   }
