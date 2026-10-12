@@ -12,10 +12,10 @@ const username = process.env.TEST_USERNAME || 'standard_user';
 // The password comes from the PASSWORD secret in CI, or from your terminal locally.
 // It is never written in the code. Failing loudly beats a confusing login error later.
 function requirePassword(): string {
-  const password = process.env.PASSWORD;
+  const password = process.env.TEST_PASSWORD;
   if (!password) {
     throw new Error(
-      'PASSWORD is not set. Add it as a repository secret in GitHub, ' +
+      'TEST_PASSWORD is not set. Add it as a repository secret in GitHub, ' +
         'or set it in your terminal for local runs (see README).',
     );
   }
